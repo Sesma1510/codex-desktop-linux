@@ -2309,16 +2309,80 @@ test("adds Linux single-instance lock and second-instance handoff", () => {
   assert.match(patched, /n\.app\.off\(`second-instance`,codexLinuxSecondInstanceHandler\)/);
 });
 
-test("lets explicit Linux multi-instance launches bypass the bootstrap single-instance lock", () => {
+test("forces the bootstrap single-instance lock on Linux even when upstream disables it", () => {
   const source =
     "var S=t.x({isMacOS:b,isPackaged:n.app.isPackaged});if(!(!S||n.app.requestSingleInstanceLock()))t.Jr().info(`Exiting second desktop instance`,{safe:{packaged:n.app.isPackaged,platform:process.platform}}),n.app.exit(0);else{let e=t.C(x);}";
   const patched = applyPatchTwice(applyLinuxMultiInstanceBootstrapPatch, source);
 
   assert.match(
     patched,
-    /if\(!\(!S\|\|process\.platform===`linux`&&process\.env\.CODEX_LINUX_MULTI_LAUNCH===`1`\|\|n\.app\.requestSingleInstanceLock\(\)\)\)/,
+    /if\(!\(process\.platform===`linux`\?process\.env\.CODEX_LINUX_MULTI_LAUNCH===`1`\|\|n\.app\.requestSingleInstanceLock\(\):!S\|\|n\.app\.requestSingleInstanceLock\(\)\)\)/,
   );
   assert.match(patched, /Exiting second desktop instance/);
+});
+
+test("upgrades the legacy guarded bootstrap single-instance lock to the enforced form", () => {
+  const source =
+    "var $=r.D({isMacOS:Z,isPackaged:e.app.isPackaged});if(!(!$||process.platform===`linux`&&process.env.CODEX_LINUX_MULTI_LAUNCH===`1`||e.app.requestSingleInstanceLock()))t.Vr().info(`Exiting second desktop instance`,{}),e.app.exit(0);";
+  const patched = applyPatchTwice(applyLinuxMultiInstanceBootstrapPatch, source);
+
+  assert.match(
+    patched,
+    /if\(!\(process\.platform===`linux`\?process\.env\.CODEX_LINUX_MULTI_LAUNCH===`1`\|\|e\.app\.requestSingleInstanceLock\(\):!\$\|\|e\.app\.requestSingleInstanceLock\(\)\)\)/,
+  );
+  assert.ok(!patched.includes("&&process.env.CODEX_LINUX_MULTI_LAUNCH"));
+});
+
+test("enforced bootstrap lock takes the Linux lock with upstream flag off and exits the loser", () => {
+  const source =
+    "var S=t.x({isMacOS:b,isPackaged:n.app.isPackaged});if(!(!S||n.app.requestSingleInstanceLock()))n.app.exit(0);";
+  const patched = applyLinuxMultiInstanceBootstrapPatch(source);
+
+  const run = ({ lockResult, multiLaunch }) => {
+    const calls = { lock: 0, exit: 0 };
+    const t = { x: () => false };
+    const n = {
+      app: {
+        isPackaged: true,
+        requestSingleInstanceLock: () => {
+          calls.lock += 1;
+          return lockResult;
+        },
+        exit: () => {
+          calls.exit += 1;
+        },
+      },
+    };
+    const previous = process.env.CODEX_LINUX_MULTI_LAUNCH;
+    if (multiLaunch) {
+      process.env.CODEX_LINUX_MULTI_LAUNCH = "1";
+    } else {
+      delete process.env.CODEX_LINUX_MULTI_LAUNCH;
+    }
+    try {
+      new Function("t", "n", "b", patched)(t, n, false);
+    } finally {
+      if (previous == null) {
+        delete process.env.CODEX_LINUX_MULTI_LAUNCH;
+      } else {
+        process.env.CODEX_LINUX_MULTI_LAUNCH = previous;
+      }
+    }
+    return calls;
+  };
+
+  // process.platform is linux in CI and on dev machines for this repo.
+  const winner = run({ lockResult: true, multiLaunch: false });
+  assert.equal(winner.lock, 1);
+  assert.equal(winner.exit, 0);
+
+  const loser = run({ lockResult: false, multiLaunch: false });
+  assert.equal(loser.lock, 1);
+  assert.equal(loser.exit, 1);
+
+  const sideBySide = run({ lockResult: true, multiLaunch: true });
+  assert.equal(sideBySide.lock, 0);
+  assert.equal(sideBySide.exit, 0);
 });
 
 test("recognizes bootstrap-owned single-instance handoff in current bundles", () => {
