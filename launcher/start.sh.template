@@ -1416,6 +1416,25 @@ find_running_app_pid() {
     return 1
 }
 
+pid_in_same_launch_instance() {
+    # The /proc scan matches by electron binary path, which side-by-side
+    # multi-launch instances share with the default app. Match instance
+    # identity via the process environment so the default app never adopts
+    # a side-by-side instance and vice versa. Substring checks on the
+    # newline-joined environ avoid grep -q pipelines, which can fail under
+    # pipefail when grep exits before the writer finishes.
+    local pid="$1"
+    local environ="/proc/$pid/environ"
+    local env_lines
+
+    env_lines=$'\n'"$(tr '\0' '\n' < "$environ" 2>/dev/null || true)"$'\n'
+    if [ "$MULTI_LAUNCH_ACTIVE" -eq 1 ]; then
+        [[ "$env_lines" == *$'\n'"CODEX_LINUX_INSTANCE_ID=$CODEX_LINUX_INSTANCE_ID"$'\n'* ]]
+    else
+        [[ "$env_lines" != *$'\n'"CODEX_LINUX_MULTI_LAUNCH=1"$'\n'* ]]
+    fi
+}
+
 discover_running_app_pid() {
     local pid
     local proc_exe
@@ -1424,7 +1443,7 @@ discover_running_app_pid() {
         [ -e "$proc_exe" ] || continue
         pid="${proc_exe#/proc/}"
         pid="${pid%/exe}"
-        if pid_matches_executable "$pid" "$SCRIPT_DIR/electron"; then
+        if pid_matches_executable "$pid" "$SCRIPT_DIR/electron" && pid_in_same_launch_instance "$pid"; then
             echo "$pid"
             return 0
         fi
@@ -1446,7 +1465,12 @@ needs_cold_start() {
 }
 
 detect_warm_start() {
-    if RUNNING_APP_PID="$(find_running_app_pid)" || { [ -S "$LAUNCH_ACTION_SOCKET" ] && RUNNING_APP_PID="$(discover_running_app_pid)"; }; then
+    # Always fall back to the /proc scan: a hidden-to-tray instance can lose
+    # both its app.pid marker (clobbered by a failed duplicate launch) and its
+    # launch-action socket (runtime dir wiped, warm start disabled, or socket
+    # setup failed), and gating the scan on the socket made such an instance
+    # undetectable — every launch then cold-started a duplicate.
+    if RUNNING_APP_PID="$(find_running_app_pid)" || RUNNING_APP_PID="$(discover_running_app_pid)"; then
         echo "$RUNNING_APP_PID" > "$APP_PID_FILE"
         if ! linux_setting_enabled "codex-linux-warm-start-enabled" 1; then
             WARM_START=0
@@ -1863,7 +1887,7 @@ reconcile_runtime_state() {
     local live_app_pid=""
     local webview_pid=""
 
-    if live_app_pid="$(find_running_app_pid)" || { [ -S "$LAUNCH_ACTION_SOCKET" ] && live_app_pid="$(discover_running_app_pid)"; }; then
+    if live_app_pid="$(find_running_app_pid)" || live_app_pid="$(discover_running_app_pid)"; then
         echo "$live_app_pid" > "$APP_PID_FILE"
         return 0
     fi
@@ -2312,6 +2336,24 @@ cleanup_launcher() {
     fi
 }
 
+# Serialize the running-app detection -> Electron spawn -> app.pid write
+# critical section across concurrent launchers. Without this, two launches
+# racing through detection can both cold-start, and the loser's cleanup later
+# deletes the survivor's app.pid marker, making it undetectable. Fd 9 stays
+# open in this shell; the flock is released explicitly, so the fd leaking
+# into child processes does not extend the lock.
+acquire_launcher_lock() {
+    command -v flock >/dev/null 2>&1 || return 0
+    exec 9>"$APP_STATE_DIR/launcher.lock" || return 0
+    if ! flock -w 30 9; then
+        echo "WARN: timed out waiting for another launcher to finish; continuing unserialized"
+    fi
+}
+
+release_launcher_lock() {
+    flock -u 9 2>/dev/null || true
+}
+
 launch_electron() {
     cd "$SCRIPT_DIR"
     log_phase "electron_launch"
@@ -2323,6 +2365,7 @@ launch_electron() {
     build_electron_launch_args
 
     if [ "$WARM_START" -eq 1 ]; then
+        release_launcher_lock
         echo "Electron warm-start handoff: pid=$RUNNING_APP_PID rendering_mode=$ELECTRON_RENDERING_MODE wslg_detected=$ELECTRON_WSLG_DETECTED ozone_platform=${ELECTRON_OZONE_PLATFORM:-default} ozone_hint=${ELECTRON_OZONE_HINT:-none} gpu_enabled=$ELECTRON_GPU_ENABLED gpu_disable_arg=$ELECTRON_GPU_DISABLE_SWITCH_IN_ARGS gpu_compositing_disabled=$ELECTRON_GPU_COMPOSITING_DISABLED gl_switch_added=$ELECTRON_GL_SWITCH_ADDED renderer_accessibility_forced=$ELECTRON_RENDERER_ACCESSIBILITY_FORCED"
         unset ELECTRON_RUN_AS_NODE
         "$SCRIPT_DIR/electron" "${ELECTRON_LAUNCH_ARGS[@]}" "${ELECTRON_ARGS[@]}"
@@ -2338,6 +2381,7 @@ launch_electron() {
     else
         echo "$ELECTRON_PID" > "$APP_PID_FILE"
     fi
+    release_launcher_lock
     log_phase "electron_spawned"
 
     set +e
@@ -2355,6 +2399,7 @@ load_packaged_runtime_helper
 prepend_managed_node_runtime_to_path
 source_feature_env_files
 register_url_scheme_handlers
+acquire_launcher_lock
 reconcile_runtime_state
 detect_warm_start
 trap cleanup_launcher EXIT
