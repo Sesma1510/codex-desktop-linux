@@ -2893,8 +2893,8 @@ if "clear_bundled_marketplace_tmp_cache\nmonitor_bundled_marketplace_tmp_permiss
     raise SystemExit("warm-start path must not clear bundled marketplace temp cache")
 if not re.search(r'if needs_cold_start; then\s+clear_bundled_marketplace_tmp_cache\s+# The runtime marketplace is populated asynchronously.*?monitor_bundled_marketplace_tmp_permissions\s+sync_browser_use_bundled_plugin_cache\s+sync_chrome_bundled_plugin_cache\s+sync_computer_use_bundled_plugin_cache\s+sync_read_aloud_bundled_plugin_cache\s+run_cold_start_hooks\s+fi', runtime_body, re.S):
     raise SystemExit("bundled marketplace cleanup, plugin sync, and cold-start hooks must run only on cold start")
-if 'if needs_cold_start && [ -z "${CODEX_CLI_PATH:-}" ]; then' not in runtime_body:
-    raise SystemExit("second-instance handoff must skip CLI lookup")
+if 'if [ -z "${CODEX_CLI_PATH:-}" ]; then' not in runtime_body:
+    raise SystemExit("launcher must run the cheap CLI lookup even for second-instance fallback")
 if 'if needs_cold_start && [ -z "$CODEX_CLI_PATH" ]; then' not in runtime_body:
     raise SystemExit("second-instance handoff must skip missing-CLI failure")
 if '"$HOME/.bun/bin/codex"' not in source:
@@ -2950,8 +2950,10 @@ if 'pid_in_same_launch_instance "$pid"' not in discover_body:
 instance_match_body = source.split("pid_in_same_launch_instance() {", 1)[1].split("discover_running_app_pid() {", 1)[0]
 if 'CODEX_LINUX_INSTANCE_ID=$CODEX_LINUX_INSTANCE_ID' not in instance_match_body or 'CODEX_LINUX_MULTI_LAUNCH=1' not in instance_match_body:
     raise SystemExit("pid_in_same_launch_instance must match instance identity from the process environment")
-if 'acquire_launcher_lock\nreconcile_runtime_state\ndetect_warm_start' not in source:
-    raise SystemExit("launcher must serialize running-app detection behind the launcher lock")
+if 'refresh_launch_state\ntrap cleanup_launcher EXIT' not in source:
+    raise SystemExit("launcher must do an initial runtime-state refresh before warm-start IPC")
+if 'if needs_cold_start; then\n    acquire_launcher_lock\n    refresh_launch_state\nfi' not in source:
+    raise SystemExit("launcher must re-check runtime state under the launcher lock immediately before cold launch")
 if 'flock -w 30 9' not in source:
     raise SystemExit("launcher lock must use a bounded flock wait so a stuck launcher cannot block launches forever")
 if launch_body.count("release_launcher_lock") != 2:

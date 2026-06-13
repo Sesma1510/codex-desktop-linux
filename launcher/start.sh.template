@@ -2354,6 +2354,13 @@ release_launcher_lock() {
     flock -u 9 2>/dev/null || true
 }
 
+refresh_launch_state() {
+    WARM_START=0
+    RUNNING_APP_PID=""
+    reconcile_runtime_state
+    detect_warm_start
+}
+
 launch_electron() {
     cd "$SCRIPT_DIR"
     log_phase "electron_launch"
@@ -2399,9 +2406,7 @@ load_packaged_runtime_helper
 prepend_managed_node_runtime_to_path
 source_feature_env_files
 register_url_scheme_handlers
-acquire_launcher_lock
-reconcile_runtime_state
-detect_warm_start
+refresh_launch_state
 trap cleanup_launcher EXIT
 
 if send_warm_start_launch_action "${LAUNCHER_ARGS[@]}"; then
@@ -2426,7 +2431,7 @@ else
     log_phase "warm_start_ready"
 fi
 
-if needs_cold_start && [ -z "${CODEX_CLI_PATH:-}" ]; then
+if [ -z "${CODEX_CLI_PATH:-}" ]; then
     CODEX_CLI_PATH="$(find_codex_cli || true)"
     export CODEX_CLI_PATH
     log_phase "cli_lookup"
@@ -2483,6 +2488,11 @@ if needs_cold_start; then
     run_cold_start_hooks
 fi
 resolve_browser_use_runtime_env
+
+if needs_cold_start; then
+    acquire_launcher_lock
+    refresh_launch_state
+fi
 
 echo "Using CODEX_CLI_PATH=${CODEX_CLI_PATH:-warm-start-skip}"
 echo "Using managed Node.js runtime=${CODEX_MANAGED_NODE_RUNTIME_DIR:-$SCRIPT_DIR/resources/node-runtime}"
