@@ -9,13 +9,15 @@
 # Usage: node-repl-reaper.sh <app-dir> [once|watch]
 #   once   (default) one reap pass
 #   watch  reap every CODEX_NODE_REPL_REAPER_INTERVAL seconds (default 300)
-#          until no electron from <app-dir> is running, then a final pass
+#          after the first electron from <app-dir> appears, then exit with a
+#          final pass once no matching electron remains
 set -u
 
 APP_DIR="${1:?usage: node-repl-reaper.sh <app-dir> [once|watch]}"
 MODE="${2:-once}"
 NODE_REPL_BIN="$APP_DIR/resources/node_repl"
 WATCH_INTERVAL_SECONDS="${CODEX_NODE_REPL_REAPER_INTERVAL:-300}"
+STARTUP_GRACE_SECONDS="${CODEX_NODE_REPL_REAPER_STARTUP_GRACE:-120}"
 KILL_GRACE_SECONDS="${CODEX_NODE_REPL_REAPER_KILL_GRACE:-5}"
 
 # True when the process's argv[0] is exactly <bin>. Chromium/Electron
@@ -99,7 +101,25 @@ install_app_is_running() {
     return 1
 }
 
+wait_for_initial_electron() {
+    local waited=0
+    while ! install_app_is_running; do
+        if [ "$waited" -ge "$STARTUP_GRACE_SECONDS" ]; then
+            echo "node-repl-reaper: no $APP_DIR/electron appeared within ${STARTUP_GRACE_SECONDS}s; final pass and exit"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
 if [ "$MODE" = "watch" ]; then
+    if ! wait_for_initial_electron; then
+        reap_leaked_node_repls
+        exit 0
+    fi
+
     while :; do
         reap_leaked_node_repls
         if ! install_app_is_running; then

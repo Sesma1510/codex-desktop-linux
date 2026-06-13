@@ -16,7 +16,9 @@ reap independently.
 
 - **Cold start**: the launcher hook starts one watchdog per install
   (pid file: `<state-dir>/node-repl-reaper.pid`). The watchdog reaps every
-  5 minutes (`CODEX_NODE_REPL_REAPER_INTERVAL` seconds to override) and
+  5 minutes (`CODEX_NODE_REPL_REAPER_INTERVAL` seconds to override), waits up
+  to 120 seconds for the launching Electron process to appear
+  (`CODEX_NODE_REPL_REAPER_STARTUP_GRACE` seconds to override), and
   self-terminates with a final pass once no electron from the install is
   running.
 - **App exit**: the after-exit hook runs one immediate pass.

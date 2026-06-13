@@ -14,9 +14,11 @@ reaper="$app_dir/.codex-linux/node-repl-reaper.sh"
 
 if [ -f "$pid_file" ]; then
     existing="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ -n "$existing" ] && [ -d "/proc/$existing" ] &&
-        tr '\0' ' ' < "/proc/$existing/cmdline" 2>/dev/null | grep -q 'node-repl-reaper'; then
-        exit 0
+    if [ -n "$existing" ] && [ -d "/proc/$existing" ]; then
+        existing_cmdline="$(tr '\0' ' ' < "/proc/$existing/cmdline" 2>/dev/null || true)"
+        case "$existing_cmdline" in
+            *node-repl-reaper*) exit 0 ;;
+        esac
     fi
     rm -f "$pid_file"
 fi
