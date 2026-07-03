@@ -21,9 +21,33 @@ building packages, then list the feature ids you want:
 `features.json` is ignored by git so local choices do not leak into commits.
 Feature choices are read during the install/build pipeline; if you change this
 file after an app has already been generated, rerun the install/build step.
-Native packages preserve the enabled feature id list in the packaged
-update-builder bundle, so `codex-update-manager` rebuilds keep the same opt-in
-features across auto-updates.
+Native packages preserve the enabled feature id list and settings in the
+packaged update-builder bundle, so `codex-update-manager` rebuilds keep the
+same opt-in features across auto-updates.
+
+Feature-specific local settings can live in the same gitignored file under
+`settings.<feature-id>`. Keep tracked `feature.json` files as shipped defaults;
+do not edit them for personal preferences. Feature patch descriptors receive
+this object as `context.feature.settings`:
+
+```json
+{
+  "enabled": [
+    "ui-tweaks"
+  ],
+  "settings": {
+    "ui-tweaks": {
+      "tweaks": {
+        "sidebar": {
+          "projectName": {
+            "style": "font-weight: 700 !important; padding-top: 0.25rem;"
+          }
+        }
+      }
+    }
+  }
+}
+```
 
 Feature directories can be tracked repository features at `linux-features/<id>/`
 or private user-local features at `linux-features/local/<id>/`. The
@@ -76,6 +100,9 @@ Declarative runtime hooks are staged under `codex-app/.codex-linux/`:
 - `runtimeHooks.env` writes literal `KEY=VALUE` files consumed by the launcher
 - `runtimeHooks.prelaunch` runs synchronously before webview setup
 - `runtimeHooks.electronArgs` appends one Electron argument per line
+- `runtimeHooks.launcher` runs before final Electron args are built; executable
+  hooks receive current Electron args as argv and can print `env KEY=VALUE` or
+  `electron-arg VALUE` lines
 - `runtimeHooks.coldStart` runs background hooks after bundled plugin cache sync
 - `runtimeHooks.afterExit` runs after Electron exits while preserving the
   original Electron exit status

@@ -25,6 +25,7 @@ const {
   applyLinuxRemoteControlCopyPatch,
   applyLinuxRemoteControlPreserveConfigPatch,
   applyLinuxRemoteControlFeatureSyncPatch,
+  applyLinuxRemoteControlEnableForHostParamsPatch,
   applyLinuxRemoteControlLoadGatePatch,
   applyLinuxRemoteControlEnablementBridgePatch,
   applyLinuxRemoteMobileActiveStatusPatch,
@@ -251,6 +252,23 @@ function syntheticChromeBrowserClientBundle() {
   ].join("");
 }
 
+function syntheticCurrentChromeBrowserClientBundle() {
+  return [
+    "var CN=[\"chrome\",\"iab\",\"cdp\"];function m_(e){return CN.some(t=>t===e)}",
+    "var y_=\"BROWSER_USE_AVAILABLE_BACKENDS\";",
+    "function nl(e){return globalThis[e]??null}function F_(e){return Array.isArray(e)?e:String(e).split(\",\")}",
+    "function N_(){let e=nl(y_);return e==null?null:F_(e).filter(m_)}",
+  ].join("");
+}
+
+function syntheticModernChromeBrowserClientBundle() {
+  return [
+    "var wU=[\"chrome\",\"iab\",\"cdp\"];function Jv(t){return wU.some(e=>e===t)}",
+    "var Qv=\"BROWSER_USE_AVAILABLE_BACKENDS\";",
+    "class Browsers{constructor(e=null){this.browserPreference=e}async getForUrl(){}preferredWindowIdFor(e){return this.browserPreference?.preferredWindowId}}",
+  ].join("");
+}
+
 function syntheticAppServerManagerSignalsBundle() {
   return [
     "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
@@ -284,6 +302,14 @@ function syntheticAppMainEnablementBridgeBundle() {
   return [
     "var DF=`[remote-connections/slingshot-gate-bridge]`;",
     "function OF(){let e=(0,Z.c)(3),t=sc(),n,r;return e[0]===t?(n=e[1],r=e[2]):(n=()=>{$o(`set-remote-control-connections-enabled`,{params:{enabled:t}}).catch(e=>{q.warning(`${DF} sync_failed`,{safe:{enabled:t},sensitive:{error:e}})})},r=[t],e[0]=t,e[1]=n,e[2]=r),(0,Q.useEffect)(n,r),null}",
+  ].join("");
+}
+
+function syntheticCurrentAppMainEnablementBridgeBundle() {
+  return [
+    "var fH=`[remote-connections/slingshot-gate-bridge]`;",
+    "function mH(){let e=(0,Q.c)(6),{checkGate:t,isLoading:n}=eo(),r;e[0]===t?r=e[1]:(r=t(`1042620455`),e[0]=t,e[1]=r);let i=r,a,o;return e[2]!==n||e[3]!==i?(a=()=>{n||qt(`set-remote-control-connections-enabled`,{params:{enabled:i}}).catch(e=>{Y.warning(`${fH} sync_failed`,{safe:{slingshotEnabled:i},sensitive:{error:e}})})},o=[n,i],e[2]=n,e[3]=i,e[4]=a,e[5]=o):(a=e[4],o=e[5]),(0,$.useEffect)(a,o),null}",
+    "var handlers={\"set-remote-control-enabled-for-host\":pU((e,{enabled:t})=>e.sendRequest(t?`remoteControl/enable`:`remoteControl/disable`,null))};",
   ].join("");
 }
 
@@ -679,6 +705,7 @@ test("remote mobile control feature exposes opt-in main-bundle and webview patch
       "feature:remote-mobile-control:linux-remote-connections-refresh",
       "feature:remote-mobile-control:linux-remote-mobile-conversation-hydration",
       "feature:remote-mobile-control:linux-remote-control-status-read-guard",
+      "feature:remote-mobile-control:linux-remote-control-enable-for-host-params",
       "feature:remote-mobile-control:linux-remote-control-enablement-bridge",
       "feature:remote-mobile-control:linux-remote-mobile-active-status",
       "feature:remote-mobile-control:linux-remote-mobile-projectless-remote-task",
@@ -702,6 +729,7 @@ test("remote mobile control feature exposes opt-in main-bundle and webview patch
       "webview-asset",
       "webview-asset",
       "webview-asset",
+      "webview-asset",
     ]);
 
     const visibilityDescriptor = descriptors.find((descriptor) =>
@@ -711,6 +739,17 @@ test("remote mobile control feature exposes opt-in main-bundle and webview patch
     assert.equal(visibilityDescriptor.pattern.test("remote-connections-settings-fixture.js"), true);
     assert.equal(visibilityDescriptor.pattern.test("use-plugin-install-flow-fixture.js"), true);
     assert.equal(visibilityDescriptor.pattern.test("app-main-fixture.js"), false);
+
+    const statusGuardDescriptor = descriptors.find((descriptor) =>
+      descriptor.id === "feature:remote-mobile-control:linux-remote-control-status-read-guard"
+    );
+    assert.ok(statusGuardDescriptor);
+    assert.equal(
+      statusGuardDescriptor.pattern.test(
+        "app-initial~app-main~worktree-init-v2-page~remote-conversation-page~pull-requests-page~plug~kmtatxxf-IUI8plS9.js",
+      ),
+      true,
+    );
   });
 });
 
@@ -1380,6 +1419,32 @@ test("Linux remote mobile Chrome bridge patch preserves Chrome when backends con
   assert.deepEqual([...context.module.exports()], ["chrome", "iab"]);
 });
 
+test("Linux remote mobile Chrome bridge patch handles current browser-client backend allowlist shape", () => {
+  const source = syntheticCurrentChromeBrowserClientBundle();
+  const patched = applyLinuxRemoteMobileChromeBridgePatch(source);
+
+  assert.notEqual(patched, source);
+  assert.match(patched, /codexLinuxRemoteMobileBrowserBackends/);
+  assert.match(patched, /function N_\(\)\{let e=nl\(y_\);return codexLinuxRemoteMobileBrowserBackends/);
+  assert.equal(applyLinuxRemoteMobileChromeBridgePatch(patched), patched);
+
+  const context = {
+    BROWSER_USE_AVAILABLE_BACKENDS: ["iab"],
+    module: { exports: {} },
+    process: { platform: "linux" },
+  };
+  vm.runInNewContext(`${patched};module.exports=N_;`, context);
+  assert.deepEqual([...context.module.exports()], ["chrome", "iab"]);
+});
+
+test("Linux remote mobile Chrome bridge patch no-ops on upstream browser preference routing", () => {
+  const source = syntheticModernChromeBrowserClientBundle();
+  const { result, warnings } = captureWarnings(() => applyLinuxRemoteMobileChromeBridgePatch(source));
+
+  assert.equal(result, source);
+  assert.deepEqual(warnings, []);
+});
+
 test("Linux remote mobile Chrome bridge patch warns when browser-client needles drift", () => {
   const source = "var e2=[\"chrome\",\"iab\",\"cdp\"];function ly(e){return e2.some(t=>t===e)}";
   const { result, warnings } = captureWarnings(() => applyLinuxRemoteMobileChromeBridgePatch(source));
@@ -1397,10 +1462,17 @@ test("Linux remote mobile conversation hydration patch handles current app-serve
   assert.match(patched, /h\?\.type===`active`\|\|h\?\.type===`idle`/);
   assert.match(patched, /codexLinuxRemoteMobileHydrateUnknownTurn/);
   assert.match(patched, /codexLinuxRemoteMobileNotificationQueue/);
+  assert.match(patched, /codexLinuxRemoteMobileHydrationInFlight/);
+  assert.match(patched, /n\.params\?\.turn\?\.threadId\?\?n\.params\?\.thread\?\.id/);
+  assert.doesNotMatch(patched, /n\.params\?\.threadId/);
+  assert.match(patched, /Skipping hydration for ambiguous turn\/started/);
   assert.match(patched, /codexLinuxRemoteMobilePendingNotifications\?\?=new Map/);
-  assert.match(patched, /this\.readThread\(r,\{includeTurns:!1\}\)/);
+  assert.match(patched, /codexLinuxRemoteMobileInFlightHydrations\?\?=new Map/);
+  assert.match(patched, /this\.readThread\(d,\{includeTurns:!1\}\)/);
   assert.match(patched, /Hydrating conversation for turn\/started/);
+  assert.match(patched, /Queueing turn\/started for hydrating conversation/);
   assert.match(patched, /this\.upsertConversationFromThread\(t\)/);
+  assert.match(patched, /this\.codexLinuxRemoteMobileInFlightHydrations\?\.delete\(d\)/);
   assert.match(patched, /for\(let e of c\)this\.onNotification\(e\.method,e\.params\)/);
   assert.match(patched, /Queueing item\/started for hydrating conversation/);
   assert.match(patched, /Queueing item\/completed for hydrating conversation/);
@@ -1408,6 +1480,163 @@ test("Linux remote mobile conversation hydration patch handles current app-serve
   assert.doesNotMatch(patched, /captureBrowserUseTurnRoute/);
   assert.doesNotMatch(patched, /releaseBrowserUseTurnRoute/);
   assert.equal(applyLinuxRemoteMobileConversationHydrationPatch(patched), patched);
+});
+
+test("Linux remote mobile hydration skips turn ids before reading threads", () => {
+  const source = syntheticAppServerManagerSignalsBundle();
+  const patched = applyLinuxRemoteMobileConversationHydrationPatch(source);
+  const context = {
+    module: { exports: {} },
+    I: (value) => value,
+    z: { error() {}, warning() {} },
+  };
+  vm.runInNewContext(`${patched};module.exports=T;`, context);
+  const manager = new context.module.exports();
+  manager.conversations = new Map();
+  manager.readThread = () => {
+    throw new Error("readThread should not be called for ambiguous turn ids");
+  };
+
+  manager.onNotification("turn/started", {
+    threadId: "turn-a",
+    turn: { id: "turn-a" },
+  });
+});
+
+test("Linux remote mobile hydration uses captured turn id normalizer helper", () => {
+  const source = syntheticAppServerManagerSignalsBundle().replaceAll("I(", "J(");
+  const patched = applyLinuxRemoteMobileConversationHydrationPatch(source);
+
+  assert.match(patched, /J\(l\)/);
+  assert.match(patched, /J\(u\)/);
+  assert.doesNotMatch(patched, /I\(l\)/);
+  assert.doesNotMatch(patched, /I\(u\)/);
+
+  const context = {
+    module: { exports: {} },
+    J: (value) => value,
+    z: { error() {}, warning() {} },
+  };
+  vm.runInNewContext(`${patched};module.exports=T;`, context);
+  const manager = new context.module.exports();
+  manager.conversations = new Map();
+  manager.readThread = () => {
+    throw new Error("readThread should not be called for ambiguous turn ids");
+  };
+
+  manager.onNotification("turn/started", {
+    threadId: "turn-a",
+    turn: { id: "turn-a" },
+  });
+});
+
+test("Linux remote mobile hydration ignores top-level thread ids without nested thread identity", () => {
+  const source = syntheticAppServerManagerSignalsBundle();
+  const patched = applyLinuxRemoteMobileConversationHydrationPatch(source);
+  const context = {
+    module: { exports: {} },
+    I: (value) => value,
+    z: { error() {}, warning() {} },
+  };
+  vm.runInNewContext(`${patched};module.exports=T;`, context);
+  const manager = new context.module.exports();
+  manager.conversations = new Map();
+  manager.readThread = () => {
+    throw new Error("readThread should not be called without nested thread identity");
+  };
+
+  manager.onNotification("turn/started", {
+    threadId: "thread-a",
+    turn: { id: "turn-a" },
+  });
+});
+
+test("Linux remote mobile hydration uses nested real thread ids", async () => {
+  const source = syntheticAppServerManagerSignalsBundle();
+  const patched = applyLinuxRemoteMobileConversationHydrationPatch(source);
+  const context = {
+    module: { exports: {} },
+    I: (value) => value,
+    setTimeout,
+    z: { error() {}, warning() {} },
+  };
+  vm.runInNewContext(`${patched};module.exports=T;`, context);
+  const manager = new context.module.exports();
+  const readThreadIds = [];
+  const streamed = [];
+  manager.conversations = new Map();
+  manager.readThread = async (threadId) => {
+    readThreadIds.push(threadId);
+    return { thread: { id: threadId } };
+  };
+  manager.upsertConversationFromThread = (thread) => {
+    manager.conversations.set(thread.id, thread);
+  };
+  manager.markConversationStreaming = (threadId) => {
+    streamed.push(threadId);
+  };
+  manager.updateConversationState = () => {};
+
+  manager.onNotification("turn/started", {
+    threadId: "turn-a",
+    turn: { id: "turn-a", threadId: "thread-a" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(readThreadIds, ["thread-a"]);
+  assert.deepEqual(streamed, ["thread-a"]);
+});
+
+test("Linux remote mobile hydration dedupes concurrent unknown turn reads", async () => {
+  const source = syntheticAppServerManagerSignalsBundle();
+  const patched = applyLinuxRemoteMobileConversationHydrationPatch(source);
+  const context = {
+    module: { exports: {} },
+    I: (value) => value,
+    setTimeout,
+    z: { error() {}, warning() {} },
+  };
+  vm.runInNewContext(`${patched};module.exports=T;`, context);
+  const manager = new context.module.exports();
+  const readThreadIds = [];
+  const streamed = [];
+  let resolveRead;
+
+  manager.conversations = new Map();
+  manager.readThread = (threadId) => {
+    readThreadIds.push(threadId);
+    return new Promise((resolve) => {
+      resolveRead = () => resolve({ thread: { id: threadId } });
+    });
+  };
+  manager.upsertConversationFromThread = (thread) => {
+    manager.conversations.set(thread.id, thread);
+  };
+  manager.markConversationStreaming = (threadId) => {
+    streamed.push(threadId);
+  };
+  manager.updateConversationState = () => {};
+
+  manager.onNotification("turn/started", {
+    threadId: "turn-a",
+    turn: { id: "turn-a", threadId: "thread-a" },
+  });
+  manager.onNotification("turn/started", {
+    threadId: "turn-b",
+    turn: { id: "turn-b", threadId: "thread-a" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(readThreadIds, ["thread-a"]);
+  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications.get("thread-a").length, 2);
+  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations.has("thread-a"), true);
+
+  resolveRead();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications.has("thread-a"), false);
+  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations.has("thread-a"), false);
+  assert.deepEqual(streamed, ["thread-a", "thread-a"]);
 });
 
 test("Linux remote mobile conversation hydration patch retries transient and missing thread reads", () => {
@@ -1497,6 +1726,34 @@ test("Linux remote-control status guard skips slow remote SSH status reads", asy
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(localRequests, 1);
   assert.equal(values.get("local").status, "enabled");
+});
+
+test("Linux remote-control status guard skips remote-control environment status reads", () => {
+  const source = syntheticAppServerManagerStatusBundle();
+  const patched = applyLinuxRemoteControlStatusReadGuardPatch(source);
+
+  assert.match(patched, /startsWith\(`remote-control:`\)/);
+
+  const context = {
+    module: { exports: {} },
+    navigator: { userAgent: "X11; Linux x86_64" },
+  };
+  vm.runInNewContext(`${patched};module.exports={codexLinuxRemoteControlShouldReadStatus};`, context);
+  const { codexLinuxRemoteControlShouldReadStatus } = context.module.exports;
+
+  assert.equal(codexLinuxRemoteControlShouldReadStatus("remote-control:env_test"), false);
+  assert.equal(codexLinuxRemoteControlShouldReadStatus("remote-ssh-discovered:dev"), false);
+  assert.equal(codexLinuxRemoteControlShouldReadStatus("local"), true);
+});
+
+test("Linux remote-control status guard migrates older remote-ssh-only guard", () => {
+  const oldPatched = applyLinuxRemoteControlStatusReadGuardPatch(syntheticAppServerManagerStatusBundle()).replace(
+    "||e.startsWith(`remote-control:`)",
+    "",
+  );
+  const patched = applyLinuxRemoteControlStatusReadGuardPatch(oldPatched);
+
+  assert.match(patched, /startsWith\(`remote-control:`\)/);
 });
 
 test("Linux remote-control settings UX patch warns when SSH release handling drifts after partial patching", () => {
@@ -1646,6 +1903,68 @@ test("Linux remote-control enablement bridge loads remote-control clients on Lin
   assert.equal(calls.length, 1);
   assert.equal(calls[0].method, "set-remote-control-connections-enabled");
   assert.equal(calls[0].params.enabled, true);
+});
+
+test("Linux remote-control enablement bridge omits params for current host toggle handler", async () => {
+  const source = syntheticCurrentAppMainEnablementBridgeBundle();
+  const patched = applyLinuxRemoteControlEnablementBridgePatch(source);
+
+  assert.notEqual(patched, source);
+  assert.match(patched, /codexLinuxRemoteControlEnableForHostParams/);
+  assert.doesNotMatch(patched, /remoteControl\/disable`,null/);
+  assert.equal(applyLinuxRemoteControlEnablementBridgePatch(patched), patched);
+
+  const calls = [];
+  const context = {
+    pU: (handler) => handler,
+    host: {
+      sendRequest(method, params) {
+        calls.push({ method, params });
+        return Promise.resolve({ status: "enabled" });
+      },
+    },
+  };
+  await vm.runInNewContext(`${patched};handlers["set-remote-control-enabled-for-host"](host,{enabled:true});`, context);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "remoteControl/enable");
+  assert.equal(calls[0].params, undefined);
+});
+
+test("Linux remote-control host toggle params patch handles automations app-main bundle", async () => {
+  const source =
+    "var handlers={\"set-remote-control-enabled-for-host\":Q7((e,{enabled:t})=>e.sendRequest(t?`remoteControl/enable`:`remoteControl/disable`,null)),\"start-remote-control-pairing-for-host\":Q7((e,{manualCode:t})=>e.sendRequest(`remoteControl/pairing/start`,{manualCode:t}))};";
+  const patched = applyLinuxRemoteControlEnableForHostParamsPatch(source);
+
+  assert.notEqual(patched, source);
+  assert.match(patched, /codexLinuxRemoteControlEnableForHostParams/);
+  assert.doesNotMatch(patched, /remoteControl\/disable`,null/);
+  assert.equal(applyLinuxRemoteControlEnableForHostParamsPatch(patched), patched);
+
+  const calls = [];
+  const context = {
+    Q7: (handler) => handler,
+    host: {
+      sendRequest(method, params) {
+        calls.push({ method, params });
+        return Promise.resolve({ status: "enabled" });
+      },
+    },
+  };
+  await vm.runInNewContext(`${patched};handlers["set-remote-control-enabled-for-host"](host,{enabled:true});`, context);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "remoteControl/enable");
+  assert.equal(calls[0].params, undefined);
+});
+
+test("Linux remote-control enablement bridge warns when host toggle params needle drifts", () => {
+  const source =
+    "var handlers={\"set-remote-control-enabled-for-host\":pU((e,{enabled:t})=>e.sendRequest((t?`remoteControl/enable`:`remoteControl/disable`),null))};";
+  const { result, warnings } = captureWarnings(() => applyLinuxRemoteControlEnablementBridgePatch(source));
+
+  assert.equal(result, source);
+  assert.ok(warnings.some((warning) => warning.includes("enable-for-host params needle")));
 });
 
 test("Linux remote-control enablement bridge migrates old auto-connect cleanup patch", () => {

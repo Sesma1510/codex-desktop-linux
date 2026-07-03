@@ -10,8 +10,11 @@ module.exports = [
     phase: "webview-asset",
     order: 1050,
     ciPolicy: "required-upstream",
-    pattern: /^app-server-manager-signals-.*\.js$/,
-    missingDescription: "app-server manager webview bundle",
+    // Older DMGs emit granular hook chunks; 26.623+ merges them into the shared
+    // `app-initial~app-main~…` bundle. Match both so the patch keeps targeting
+    // the chunk that actually carries the subagent metadata module.
+    pattern: /^(?:app-server-manager-signals|use-host-config|app-initial~app-main~).*\.js$/,
+    missingDescription: "subagent metadata webview bundle",
     skipDescription: "subagent nickname metadata shape patch",
     apply: applySubagentNicknameMetadataPatch,
   },

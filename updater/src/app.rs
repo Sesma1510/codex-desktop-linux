@@ -11,7 +11,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
-use fs4::fs_std::FileExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
@@ -140,6 +139,40 @@ fn sync_and_persist(
     persist_if_changed(paths, state, &original_state)
 }
 
+fn reload_state_from_disk(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+) -> Result<()> {
+    let previous_status = state.status.clone();
+    let previous_candidate_version = state.candidate_version.clone();
+    let previous_waiting_auto_install = state.waiting_for_app_exit_auto_install;
+
+    let loaded =
+        PersistedState::load_or_default(&paths.state_file, effective_auto_install(config))?;
+    let mut refreshed = loaded.clone();
+    sync_runtime_state(config, &mut refreshed);
+    persist_if_changed(paths, &refreshed, &loaded)?;
+
+    if previous_status != refreshed.status
+        || previous_candidate_version != refreshed.candidate_version
+        || previous_waiting_auto_install != refreshed.waiting_for_app_exit_auto_install
+    {
+        info!(
+            previous_status = ?previous_status,
+            status = ?refreshed.status,
+            previous_candidate_version = previous_candidate_version.as_deref(),
+            candidate_version = refreshed.candidate_version.as_deref(),
+            previous_waiting_auto_install,
+            waiting_auto_install = refreshed.waiting_for_app_exit_auto_install,
+            "reloaded updater state from disk"
+        );
+    }
+
+    *state = refreshed;
+    Ok(())
+}
+
 fn normalize_workspace_dir_and_persist(
     state: &mut PersistedState,
     paths: &RuntimePaths,
@@ -167,6 +200,31 @@ fn maybe_prune_workspace_cache(workspace_root: &Path, state: &PersistedState) {
             );
         }
     }
+}
+
+fn maybe_prune_generated_artifacts(config: &RuntimeConfig) {
+    match cache_cleanup::prune_generated_artifacts(
+        &config.generated_artifact_cleanup,
+        &config.builder_bundle_root,
+    ) {
+        Ok(summary) if summary.pruned_paths > 0 => {
+            info!(
+                inspected_roots = summary.inspected_roots,
+                pruned_paths = summary.pruned_paths,
+                bytes_removed = summary.bytes_removed,
+                "pruned generated wrapper artifacts"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(?error, "failed to prune generated wrapper artifacts");
+        }
+    }
+}
+
+fn maybe_prune_caches(config: &RuntimeConfig, state: &PersistedState) {
+    maybe_prune_workspace_cache(&config.workspace_root, state);
+    maybe_prune_generated_artifacts(config);
 }
 
 fn clear_wrapper_update_candidate_and_persist(
@@ -265,13 +323,13 @@ fn try_acquire_check_lock(paths: &RuntimePaths) -> Result<Option<CheckLock>> {
         .open(&lock_path)
         .with_context(|| format!("Failed to open {}", lock_path.display()))?;
 
-    match file.try_lock_exclusive() {
-        Ok(true) => {}
-        Ok(false) => {
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
             info!("skipping upstream check because another check is already active");
             return Ok(None);
         }
-        Err(error) => {
+        Err(fs::TryLockError::Error(error)) => {
             return Err(error).with_context(|| format!("Failed to lock {}", lock_path.display()));
         }
     }
@@ -293,6 +351,23 @@ fn update_install_is_pending(status: &UpdateStatus) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PendingInstallRecovery {
+    NoChange,
+    CandidateInstalled,
+    SupersededByInstalledVersion,
+}
+
+impl PendingInstallRecovery {
+    fn completed(self) -> bool {
+        !matches!(self, Self::NoChange)
+    }
+
+    fn should_notify_installed(self) -> bool {
+        matches!(self, Self::CandidateInstalled)
+    }
+}
+
 async fn run_daemon(
     config: &RuntimeConfig,
     state: &mut PersistedState,
@@ -303,9 +378,8 @@ async fn run_daemon(
     complete_current_dmg_update_if_already_installed(config, state, paths)?;
     codex_cli::reconcile_if_present(state, paths)?;
     normalize_workspace_dir_and_persist(state, paths)?;
-    maybe_prune_workspace_cache(&config.workspace_root, state);
+    maybe_prune_caches(config, state);
     maybe_notify_cli_missing(state, paths, config.notifications)?;
-    maybe_notify_installed(state, paths, config.notifications)?;
     if packaged_runtime_removed(config) {
         info!("packaged app files are gone; stopping updater daemon");
         return Ok(());
@@ -313,10 +387,10 @@ async fn run_daemon(
     info!("daemon initialized");
 
     time::sleep(Duration::from_secs(config.initial_check_delay_seconds)).await;
-    if let Err(error) = run_check_cycle(config, state, paths).await {
+    if let Err(error) = run_check_cycle_from_disk(config, state, paths).await {
         error!(?error, "initial check failed");
     }
-    if let Err(error) = reconcile_pending_install(config, state, paths).await {
+    if let Err(error) = reconcile_pending_install_from_disk(config, state, paths).await {
         error!(?error, "initial reconciliation failed");
     }
 
@@ -333,12 +407,12 @@ async fn run_daemon(
 
         tokio::select! {
             _ = check_interval.tick() => {
-                if let Err(error) = run_check_cycle(config, state, paths).await {
+                if let Err(error) = run_check_cycle_from_disk(config, state, paths).await {
                     error!(?error, "periodic check failed");
                 }
             }
             _ = reconcile_interval.tick() => {
-                if let Err(error) = reconcile_pending_install(config, state, paths).await {
+                if let Err(error) = reconcile_pending_install_from_disk(config, state, paths).await {
                     error!(?error, "pending install reconciliation failed");
                 }
             }
@@ -364,9 +438,8 @@ async fn run_check_now(
     complete_current_dmg_update_if_already_installed(config, state, paths)?;
     codex_cli::reconcile_if_present(state, paths)?;
     normalize_workspace_dir_and_persist(state, paths)?;
-    maybe_prune_workspace_cache(&config.workspace_root, state);
+    maybe_prune_caches(config, state);
     maybe_notify_cli_missing(state, paths, config.notifications)?;
-    maybe_notify_installed(state, paths, config.notifications)?;
     if if_stale && upstream_check_is_fresh(config, state) {
         if let Err(error) = detect_and_record_wrapper_update(config, state, paths) {
             warn!(
@@ -537,7 +610,7 @@ fn run_status(
 ) -> Result<()> {
     codex_cli::reconcile_if_present(state, paths)?;
     complete_current_dmg_update_if_already_installed(config, state, paths)?;
-    complete_pending_install_if_already_installed(state, paths)?;
+    let _ = complete_pending_install_if_already_installed(state, paths)?;
     normalize_workspace_dir_and_persist(state, paths)?;
     if !config.enable_wrapper_updates {
         clear_wrapper_update_candidate_and_persist(state, paths)?;
@@ -656,7 +729,7 @@ fn prompt_install_cli(
         return Ok(PromptInstallCliOutcome::Cancelled);
     }
 
-    if !has_graphical_session() {
+    if !has_interactive_graphical_session() {
         return Ok(PromptInstallCliOutcome::NoBackend);
     }
 
@@ -687,12 +760,17 @@ fn recently_dismissed_cli_prompt(state: &PersistedState) -> bool {
     })
 }
 
-fn has_graphical_session() -> bool {
+fn has_interactive_graphical_session() -> bool {
     let has_display =
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
     let has_dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
         || std::env::var_os("XDG_RUNTIME_DIR").is_some();
     has_display && has_dbus
+}
+
+fn has_user_session_bus_for_polkit() -> bool {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+        || std::env::var_os("XDG_RUNTIME_DIR").is_some()
 }
 
 fn prefers_kdialog() -> bool {
@@ -775,6 +853,15 @@ fn run_actionable_notification_prompt() -> Result<bool> {
         notify::ActionResponse::Invoked(action) if action == "install" => Ok(true),
         _ => Ok(false),
     }
+}
+
+async fn run_check_cycle_from_disk(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+) -> Result<()> {
+    reload_state_from_disk(config, state, paths)?;
+    run_check_cycle(config, state, paths).await
 }
 
 async fn run_check_cycle(
@@ -898,7 +985,7 @@ async fn run_check_cycle(
             .clone()
             .expect("candidate version should be set before local build");
         builder::build_update(config, state, paths, &candidate_version, &downloaded.path).await?;
-        maybe_prune_workspace_cache(&config.workspace_root, state);
+        maybe_prune_caches(config, state);
         maybe_notify_update_ready(state, paths, config.notifications)?;
         Ok(())
     }
@@ -906,12 +993,21 @@ async fn run_check_cycle(
 
     if let Err(error) = result {
         mark_failed_and_persist(state, paths, error.to_string())?;
-        maybe_prune_workspace_cache(&config.workspace_root, state);
+        maybe_prune_caches(config, state);
         let _ = notify_failure(config, state, paths, &error);
         return Err(error);
     }
 
     Ok(())
+}
+
+async fn reconcile_pending_install_from_disk(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+) -> Result<()> {
+    reload_state_from_disk(config, state, paths)?;
+    reconcile_pending_install(config, state, paths).await
 }
 
 async fn reconcile_pending_install(
@@ -921,8 +1017,11 @@ async fn reconcile_pending_install(
 ) -> Result<()> {
     sync_runtime_state(config, state);
     recover_interrupted_install(state, paths)?;
-    if complete_pending_install_if_already_installed(state, paths)? {
-        let _ = maybe_notify_installed(state, paths, config.notifications);
+    let pending_recovery = complete_pending_install_if_already_installed(state, paths)?;
+    if pending_recovery.completed() {
+        if pending_recovery.should_notify_installed() {
+            let _ = maybe_notify_installed(state, paths, config.notifications);
+        }
         return Ok(());
     }
 
@@ -1036,8 +1135,11 @@ async fn run_install_ready(
         return Ok(());
     }
 
-    if complete_pending_install_if_already_installed(state, paths)? {
-        let _ = maybe_notify_installed(state, paths, config.notifications);
+    let pending_recovery = complete_pending_install_if_already_installed(state, paths)?;
+    if pending_recovery.completed() {
+        if pending_recovery.should_notify_installed() {
+            let _ = maybe_notify_installed(state, paths, config.notifications);
+        }
         println!("Codex Desktop update is already installed or superseded.");
         return Ok(());
     }
@@ -1230,22 +1332,27 @@ fn upstream_dmg_sha256_from_build_info(path: &Path) -> Option<String> {
 fn complete_pending_install_if_already_installed(
     state: &mut PersistedState,
     paths: &RuntimePaths,
-) -> Result<bool> {
+) -> Result<PendingInstallRecovery> {
     if !matches!(
         state.status,
         UpdateStatus::ReadyToInstall | UpdateStatus::WaitingForAppExit
     ) {
-        return Ok(false);
+        return Ok(PendingInstallRecovery::NoChange);
     }
 
     let Some(candidate_version) = state.candidate_version.clone().filter(|candidate| {
         installed_version_satisfies_candidate(&state.installed_version, candidate)
     }) else {
-        return Ok(false);
+        return Ok(PendingInstallRecovery::NoChange);
     };
 
     let candidate_is_installed =
         installed_version_matches_candidate(&state.installed_version, &candidate_version);
+    let recovery = if candidate_is_installed {
+        PendingInstallRecovery::CandidateInstalled
+    } else {
+        PendingInstallRecovery::SupersededByInstalledVersion
+    };
 
     state.status = UpdateStatus::Installed;
     state.waiting_for_app_exit_auto_install = false;
@@ -1258,7 +1365,7 @@ fn complete_pending_install_if_already_installed(
     cache_cleanup::normalize_artifact_workspace_dir(&paths.cache_dir, state);
     persist_state(paths, state)?;
     info!("recovered pending install state because the candidate version is already installed or superseded");
-    Ok(true)
+    Ok(recovery)
 }
 
 fn recover_interrupted_install(state: &mut PersistedState, paths: &RuntimePaths) -> Result<()> {
@@ -1647,7 +1754,7 @@ fn graphical_polkit_auth_agent_is_likely_available() -> bool {
     if std::env::var_os("CODEX_UPDATE_MANAGER_ASSUME_POLKIT_AGENT").is_some() {
         return true;
     }
-    if !has_graphical_session() {
+    if !has_user_session_bus_for_polkit() {
         return false;
     }
     polkit_auth_agent_process_is_running()
@@ -1779,6 +1886,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         }
     }
 
@@ -1816,6 +1924,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(true);
@@ -1961,12 +2070,28 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn fresh_check_now_still_clears_stale_wrapper_candidate() -> Result<()> {
+    #[test]
+    fn fresh_check_now_still_clears_stale_wrapper_candidate() -> Result<()> {
+        let _env_guard = crate::test_util::env_lock();
+        let runtime = tokio::runtime::Runtime::new()?;
         let temp = tempfile::tempdir()?;
         let paths = test_paths(temp.path());
         paths.ensure_dirs()?;
         let config = test_config(temp.path());
+        let _restore_env = crate::test_util::EnvRestoreGuard::capture(&[
+            "HOME",
+            "PATH",
+            "NVM_DIR",
+            "XDG_CONFIG_HOME",
+            "CODEX_CLI_PATH",
+            "CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP",
+        ]);
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("PATH", temp.path().join("missing-bin"));
+        std::env::remove_var("NVM_DIR");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("CODEX_CLI_PATH");
+        std::env::set_var("CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP", "1");
 
         let mut state = PersistedState::new(true);
         state.last_successful_check_at = Some(Utc::now());
@@ -1975,7 +2100,7 @@ mod tests {
         state.wrapper_changelog = Some("old changelog".to_string());
         state.wrapper_dev_mode = Some(true);
 
-        run_check_now(&config, &mut state, &paths, true).await?;
+        runtime.block_on(run_check_now(&config, &mut state, &paths, true))?;
 
         assert_eq!(state.status, UpdateStatus::Idle);
         assert_eq!(state.candidate_wrapper_commit, None);
@@ -2037,6 +2162,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2077,6 +2203,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         for status in [
@@ -2093,6 +2220,31 @@ mod tests {
             assert_eq!(state.last_check_at, None);
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_check_cycle_reloads_pending_state_written_by_another_process() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = test_paths(temp.path());
+        paths.ensure_dirs()?;
+        let mut config = test_config(temp.path());
+        config.dmg_url = "https://invalid.example/Codex.dmg".to_string();
+
+        let mut on_disk = PersistedState::new(true);
+        on_disk.status = UpdateStatus::WaitingForAppExit;
+        on_disk.candidate_version = Some("2999.03.25.010203+deadbeef".to_string());
+        on_disk.waiting_for_app_exit_auto_install = true;
+        on_disk.save(&paths.state_file)?;
+
+        let mut stale_daemon_state = PersistedState::new(true);
+        stale_daemon_state.status = UpdateStatus::Idle;
+
+        run_check_cycle_from_disk(&config, &mut stale_daemon_state, &paths).await?;
+
+        assert_eq!(stale_daemon_state.status, UpdateStatus::WaitingForAppExit);
+        assert!(stale_daemon_state.waiting_for_app_exit_auto_install);
+        assert_eq!(stale_daemon_state.last_check_at, None);
         Ok(())
     }
 
@@ -2201,6 +2353,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn std_file_try_lock_reports_would_block_for_second_holder() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let lock_path = temp.path().join("check.lock");
+        let first_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let second_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        first_file.try_lock()?;
+        let second_attempt = second_file.try_lock();
+
+        assert!(matches!(
+            second_attempt,
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        first_file.unlock()?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn missing_pending_package_marks_state_failed() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -2226,6 +2406,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(true);
@@ -2285,6 +2466,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2350,6 +2532,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(true);
@@ -2377,6 +2560,63 @@ mod tests {
         assert_eq!(state.status, UpdateStatus::WaitingForAppExit);
         assert!(state.waiting_for_app_exit_auto_install);
         assert!(!install_auth_retry_is_blocked(&state));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_reconcile_reloads_waiting_state_written_by_another_process() -> Result<()> {
+        let _env_guard = crate::test_util::env_lock();
+        let runtime = tokio::runtime::Runtime::new()?;
+        let previous_no_agent = std::env::var_os("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT");
+        std::env::set_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT", "1");
+
+        let temp = tempfile::tempdir()?;
+        let paths = test_paths(temp.path());
+        paths.ensure_dirs()?;
+        let config = test_config(temp.path());
+
+        let package_path = temp.path().join("dist/codex.deb");
+        std::fs::create_dir_all(
+            package_path
+                .parent()
+                .expect("package path should have parent"),
+        )?;
+        std::fs::write(&package_path, b"deb")?;
+
+        let mut on_disk = PersistedState::new(true);
+        on_disk.status = UpdateStatus::WaitingForAppExit;
+        on_disk.candidate_version = Some("2999.03.25.010203+deadbeef".to_string());
+        on_disk.waiting_for_app_exit_auto_install = true;
+        on_disk.artifact_paths.package_path = Some(package_path);
+        on_disk.save(&paths.state_file)?;
+
+        let mut stale_daemon_state = PersistedState::new(true);
+        stale_daemon_state.status = UpdateStatus::Idle;
+
+        let result = runtime.block_on(reconcile_pending_install_from_disk(
+            &config,
+            &mut stale_daemon_state,
+            &paths,
+        ));
+
+        if let Some(value) = previous_no_agent {
+            std::env::set_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT", value);
+        } else {
+            std::env::remove_var("CODEX_UPDATE_MANAGER_ASSUME_NO_POLKIT_AGENT");
+        }
+
+        result?;
+        assert_eq!(stale_daemon_state.status, UpdateStatus::ReadyToInstall);
+        assert!(!stale_daemon_state.waiting_for_app_exit_auto_install);
+        assert!(stale_daemon_state
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No graphical polkit authentication agent"));
+
+        let persisted = PersistedState::load_or_default(&paths.state_file, true)?;
+        assert_eq!(persisted.status, UpdateStatus::ReadyToInstall);
+        assert!(!persisted.waiting_for_app_exit_auto_install);
         Ok(())
     }
 
@@ -2422,6 +2662,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(true);
@@ -2491,6 +2732,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2551,6 +2793,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(true);
@@ -2618,6 +2861,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2681,6 +2925,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2731,6 +2976,7 @@ mod tests {
             enable_wrapper_updates: false,
             wrapper_remote: String::new(),
             wrapper_branch: "main".to_string(),
+            generated_artifact_cleanup: Default::default(),
         };
 
         let mut state = PersistedState::new(false);
@@ -2787,6 +3033,24 @@ mod tests {
     }
 
     #[test]
+    fn user_session_bus_for_polkit_allows_user_service_env_without_display() {
+        let _env_guard = crate::test_util::env_lock();
+        let _restore_env = crate::test_util::EnvRestoreGuard::capture(&[
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+        ]);
+
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+
+        assert!(has_user_session_bus_for_polkit());
+    }
+
+    #[test]
     fn manual_install_command_selects_package_kind_and_quotes_path() {
         assert_eq!(
             manual_install_command(Path::new("/tmp/codex update.pkg.tar.zst")),
@@ -2832,15 +3096,16 @@ mod tests {
         };
         paths.ensure_dirs()?;
 
-        let original_display = std::env::var_os("DISPLAY");
-        let original_wayland_display = std::env::var_os("WAYLAND_DISPLAY");
-        let original_dbus_session_bus_address = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
-        let original_xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-        let original_path = std::env::var_os("PATH");
-        let original_home = std::env::var_os("HOME");
-        let original_nvm_dir = std::env::var_os("NVM_DIR");
-        let original_skip_system_cli_lookup =
-            std::env::var_os("CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP");
+        let _restore_env = crate::test_util::EnvRestoreGuard::capture(&[
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "PATH",
+            "HOME",
+            "NVM_DIR",
+            "CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP",
+        ]);
 
         std::env::remove_var("DISPLAY");
         std::env::remove_var("WAYLAND_DISPLAY");
@@ -2858,47 +3123,6 @@ mod tests {
         state.cli_path = Some(invalid_cli_path);
 
         let outcome = prompt_install_cli(&mut state, &paths, None)?;
-
-        if let Some(value) = original_display {
-            std::env::set_var("DISPLAY", value);
-        } else {
-            std::env::remove_var("DISPLAY");
-        }
-        if let Some(value) = original_wayland_display {
-            std::env::set_var("WAYLAND_DISPLAY", value);
-        } else {
-            std::env::remove_var("WAYLAND_DISPLAY");
-        }
-        if let Some(value) = original_dbus_session_bus_address {
-            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value);
-        } else {
-            std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
-        }
-        if let Some(value) = original_xdg_runtime_dir {
-            std::env::set_var("XDG_RUNTIME_DIR", value);
-        } else {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        if let Some(value) = original_path {
-            std::env::set_var("PATH", value);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(value) = original_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        if let Some(value) = original_nvm_dir {
-            std::env::set_var("NVM_DIR", value);
-        } else {
-            std::env::remove_var("NVM_DIR");
-        }
-        if let Some(value) = original_skip_system_cli_lookup {
-            std::env::set_var("CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP", value);
-        } else {
-            std::env::remove_var("CODEX_UPDATE_MANAGER_SKIP_SYSTEM_CLI_LOOKUP");
-        }
 
         assert_eq!(outcome, PromptInstallCliOutcome::NoBackend);
         Ok(())
@@ -3090,9 +3314,10 @@ mod tests {
             .notified_events
             .insert("install_auth_required:2026.04.28.082247+abcdef12".to_string());
 
-        assert!(complete_pending_install_if_already_installed(
-            &mut state, &paths
-        )?);
+        assert_eq!(
+            complete_pending_install_if_already_installed(&mut state, &paths)?,
+            PendingInstallRecovery::CandidateInstalled
+        );
 
         assert_eq!(state.status, UpdateStatus::Installed);
         assert_eq!(state.candidate_version, None);
@@ -3127,9 +3352,10 @@ mod tests {
                 .join("cache/workspaces/2026.04.28.082247+abcdef12"),
         );
 
-        assert!(complete_pending_install_if_already_installed(
-            &mut state, &paths
-        )?);
+        assert_eq!(
+            complete_pending_install_if_already_installed(&mut state, &paths)?,
+            PendingInstallRecovery::SupersededByInstalledVersion
+        );
 
         assert_eq!(state.status, UpdateStatus::Installed);
         assert_eq!(state.candidate_version, None);
@@ -3138,6 +3364,62 @@ mod tests {
         assert_eq!(state.error_message, None);
         crate::rollback::record_current_package_as_known_good(&mut state);
         assert_eq!(state.artifact_paths.rollback_package_path, None);
+        Ok(())
+    }
+
+    #[test]
+    fn matching_pending_install_recovery_records_installed_notification_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = test_paths(temp.path());
+        paths.ensure_dirs()?;
+
+        let mut state = PersistedState::new(true);
+        state.status = UpdateStatus::ReadyToInstall;
+        state.installed_version = "2026.04.28.082247-abcdef12.fc43".to_string();
+        state.candidate_version = Some("2026.04.28.082247+abcdef12".to_string());
+
+        let recovery = complete_pending_install_if_already_installed(&mut state, &paths)?;
+        if recovery.should_notify_installed() {
+            maybe_notify_installed(&mut state, &paths, false)?;
+        }
+
+        assert_eq!(state.status, UpdateStatus::Installed);
+        assert_eq!(state.candidate_version, None);
+        assert!(state
+            .notified_events
+            .contains("installed:2026.04.28.082247-abcdef12.fc43"));
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_pending_install_recovery_skips_installed_notification_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = test_paths(temp.path());
+        paths.ensure_dirs()?;
+
+        let package_path = temp.path().join("superseded.pkg.tar.zst");
+        std::fs::write(&package_path, b"package")?;
+
+        let mut state = PersistedState::new(true);
+        state.status = UpdateStatus::ReadyToInstall;
+        state.installed_version = "2026.06.24.051729-1".to_string();
+        state.candidate_version = Some("2026.06.24.050316+4bb552bf".to_string());
+        state.artifact_paths.package_path = Some(package_path);
+        state
+            .notified_events
+            .insert("ready_to_install:2026.06.24.050316+4bb552bf".to_string());
+
+        let recovery = complete_pending_install_if_already_installed(&mut state, &paths)?;
+        if recovery.should_notify_installed() {
+            maybe_notify_installed(&mut state, &paths, false)?;
+        }
+
+        assert_eq!(state.status, UpdateStatus::Installed);
+        assert_eq!(state.candidate_version, None);
+        assert!(!state
+            .notified_events
+            .iter()
+            .any(|event| event.starts_with("installed:")));
         Ok(())
     }
 

@@ -35,6 +35,27 @@ Runtime files:
 ~/.local/state/codex-desktop/app.pid
 ```
 
+## Generated Artifact Cleanup
+
+The updater always prunes unreferenced updater workspaces under
+`~/.cache/codex-update-manager/workspaces`. Local checkout build output such as
+`dist/`, `target/`, and `codex-app/` is cleaned only when explicitly enabled.
+
+Example:
+
+```toml
+[generated_artifact_cleanup]
+enabled = true
+min_free_bytes = 10737418240 # 10 GiB
+roots = ["/home/mohit/Github/codex-desktop-linux"]
+entries = ["dist", "target", "codex-app"]
+```
+
+If `roots` is omitted, the updater uses `builder_bundle_root`. Cleanup only runs
+when the filesystem containing a root has less than `min_free_bytes` available.
+Every entry must be a relative top-level name, and the updater only cleans roots
+that look like this wrapper repository or packaged update-builder.
+
 ## Rollback
 
 If a rebuilt update installs but the previous retained package was better,
@@ -83,6 +104,21 @@ codex-update-manager status --json
 
 `make service-enable` is meant for installed packages, not repo-only generated
 apps.
+
+To temporarily pause automatic package rebuilds and installs while keeping Codex
+Desktop usable, disable the user service:
+
+```bash
+systemctl --user disable --now codex-update-manager.service
+```
+
+Launching Codex Desktop and upgrading the package will not re-enable a disabled
+updater service. Re-enable updater behavior explicitly when you want automatic
+checks again:
+
+```bash
+systemctl --user enable --now codex-update-manager.service
+```
 
 ## Wrapper Updates
 

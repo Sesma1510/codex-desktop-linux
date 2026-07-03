@@ -38,6 +38,25 @@ git-ignored `linux-features/features.json` file:
 }
 ```
 
+Feature developers can also define user-overridable settings. Keep shipped
+defaults in tracked `feature.json`, and read user-specific overrides from the
+git-ignored `features.json` file under `settings.<feature-id>`:
+
+```json
+{
+  "enabled": ["my-feature"],
+  "settings": {
+    "my-feature": {
+      "option": "local value"
+    }
+  }
+}
+```
+
+Patch descriptors receive this object as `context.feature.settings`. Treat it
+as optional, validate the shape inside the feature, warn on invalid values, and
+fall back to manifest defaults rather than failing the build.
+
 ## Lifecycle
 
 The build pipeline loads enabled features in these phases:
@@ -54,8 +73,9 @@ The build pipeline loads enabled features in these phases:
 
 Native packages copy the configured feature root into the packaged
 `update-builder` bundle, including `linux-features/local/`, and write a
-sanitized `features.json` containing only the enabled ids. Local auto-updates
-therefore rebuild with the same opt-in features.
+sanitized `features.json` containing the enabled ids plus settings for enabled
+features. Local auto-updates therefore rebuild with the same opt-in features
+and user-specific feature settings.
 
 Declarative staged files are tracked in
 `.codex-linux/linux-features-staged.json`. On the next install, the framework
@@ -128,6 +148,7 @@ Use `runtimeHooks` for launcher-visible hooks:
     "env": "env",
     "prelaunch": "prelaunch.sh",
     "electronArgs": "electron-args",
+    "launcher": "launcher.sh",
     "coldStart": "cold-start.sh",
     "afterExit": "after-exit.sh"
   }
@@ -142,6 +163,11 @@ The runtime hook types map to:
   synchronously before the packaged runtime prelaunch and webview setup.
 - `electronArgs`: copied to `.codex-linux/electron-args.d/`; each non-comment
   line is appended as one Electron argument.
+- `launcher`: copied to `.codex-linux/launcher.d/`; executable hooks run after
+  feature, user, and command-line Electron args are merged, but before final
+  Electron launch args are built. Hooks receive the current Electron args as
+  argv and may print `env KEY=VALUE` or `electron-arg VALUE` lines on stdout.
+  Unknown output lines are ignored; stderr is logged normally.
 - `coldStart`: copied to `.codex-linux/cold-start.d/`; executable hooks run in
   the background during cold start, after bundled plugin cache sync.
 - `afterExit`: copied to `.codex-linux/after-exit.d/`; executable hooks run
